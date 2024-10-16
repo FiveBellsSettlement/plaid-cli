@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -16,7 +16,7 @@ import (
 
 	"github.com/landakram/plaid-cli/pkg/plaid_cli"
 	"github.com/manifoldco/promptui"
-	"github.com/plaid/plaid-go/plaid"
+	"github.com/plaid/plaid-go/v26/plaid"
 	"github.com/spf13/cobra"
 
 	"github.com/spf13/viper"
@@ -33,20 +33,7 @@ func sliceToMap(slice []string) map[string]bool {
 	return set
 }
 
-// See https://plaid.com/docs/link/customization/#language-and-country
-var plaidSupportedCountries = []string{"US", "CA", "GB", "IE", "ES", "FR", "NL"}
 var plaidSupportedLanguages = []string{"en", "fr", "es", "nl"}
-
-func AreValidCountries(countries []string) bool {
-	supportedCountries := sliceToMap(plaidSupportedCountries)
-	for _, c := range countries {
-		if !supportedCountries[c] {
-			return false
-		}
-	}
-
-	return true
-}
 
 func IsValidLanguageCode(lang string) bool {
 	supportedLanguages := sliceToMap(plaidSupportedLanguages)
@@ -71,13 +58,10 @@ func main() {
 	viper.SetConfigType("toml")
 	viper.AddConfigPath(dataDir)
 	viper.AddConfigPath(".")
+	allowedErr := viper.ConfigFileNotFoundError{}
 	err = viper.ReadInConfig()
-	if err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			// Config file not found; ignore error if desired
-		} else {
-			log.Fatal(err)
-		}
+	if err != nil && !errors.Is(err, allowedErr) {
+		log.Fatal(err)
 	}
 
 	viper.SetEnvPrefix("")
@@ -103,17 +87,18 @@ func main() {
 
 	viper.SetDefault("plaid.countries", []string{country})
 	countriesOpt := viper.GetStringSlice("plaid.countries")
-	var countries []string
+	var countries []plaid.CountryCode
 	for _, c := range countriesOpt {
-		countries = append(countries, strings.ToUpper(c))
+		uc := strings.ToUpper(c)
+		cc, err := plaid.NewCountryCodeFromValue(uc)
+		if err != nil {
+			log.Fatalf("⚠️  Invalid country code %s. Please configure `plaid.countries` (using an envvar, PLAID_COUNTRIES, or in plaid-cli's config file) to a subset of countries that Plaid supports: %v\n", c, err)
+		}
+		countries = append(countries, *cc)
 	}
 
 	viper.SetDefault("plaid.language", lang)
 	lang = viper.GetString("plaid.language")
-
-	if !AreValidCountries(countries) {
-		log.Fatalln("⚠️  Invalid countries. Please configure `plaid.countries` (using an envvar, PLAID_COUNTRIES, or in plaid-cli's config file) to a subset of countries that Plaid supports. Plaid supports the following countries: ", plaidSupportedCountries)
-	}
 
 	if !IsValidLanguageCode(lang) {
 		log.Fatalln("⚠️  Invalid language code. Please configure `plaid.language` (using an envvar, PLAID_LANGUAGE, or in plaid-cli's config file) to a language that Plaid supports. Plaid supports the following languages: ", plaidSupportedLanguages)
@@ -132,14 +117,14 @@ func main() {
 		log.Fatalln("Invalid plaid environment. Valid plaid environments are 'development' or 'production'.")
 	}
 
-	opts := plaid.ClientOptions{
-		viper.GetString("plaid.client_id"),
-		viper.GetString("plaid.secret"),
-		plaidEnv,
-		&http.Client{},
-	}
+	clientId := viper.GetString("plaid.client_id")
+	secret := viper.GetString("plaid.secret")
 
-	client, err := plaid.NewClient(opts)
+	conf := plaid.NewConfiguration()
+	conf.AddDefaultHeader("PLAID-CLIENT-ID", clientId)
+	conf.AddDefaultHeader("PLAID-SECRET", secret)
+	conf.UseEnvironment(plaidEnv)
+	client := plaid.NewAPIClient(conf).PlaidApi
 
 	if err != nil {
 		log.Fatal(err)
@@ -168,8 +153,9 @@ func main() {
 				}
 
 				err = linker.Relink(itemOrAlias, port)
-				log.Println("Institution relinked!")
-				return
+				if err == nil {
+					log.Println("Institution relinked!")
+				}
 			} else {
 				tokenPair, err = linker.Link(port)
 				if err != nil {
@@ -184,10 +170,10 @@ func main() {
 			}
 
 			log.Println("Institution linked!")
-			log.Println(fmt.Sprintf("Item ID: %s", tokenPair.ItemID))
+			log.Printf("Item ID: %s\n", tokenPair.ItemID)
 
 			if alias, ok := data.BackAliases[tokenPair.ItemID]; ok {
-				log.Println(fmt.Sprintf("Alias: %s", alias))
+				log.Printf("Alias: %s\n", alias)
 				return
 			}
 
@@ -198,7 +184,7 @@ func main() {
 				}
 
 				if !matched && input != "" {
-					return errors.New("Valid characters: [0-9A-Za-z_]")
+					return errors.New("valid characters: [0-9A-Za-z_]")
 				}
 
 				return nil
@@ -225,13 +211,16 @@ func main() {
 	}
 
 	linkCommand.Flags().StringP("port", "p", "8080", "Port on which to serve Plaid Link")
-	viper.BindPFlag("link.port", linkCommand.Flags().Lookup("port"))
+	err = viper.BindPFlag("link.port", linkCommand.Flags().Lookup("port"))
+	if err != nil {
+		log.Fatalln(err)
+	}
 
 	tokensCommand := &cobra.Command{
 		Use:   "tokens",
 		Short: "List access tokens",
 		Run: func(cmd *cobra.Command, args []string) {
-			resolved := make(map[string]string)
+			resolved := make(map[string]string, len(data.Tokens))
 			for itemID, token := range data.Tokens {
 				if alias, ok := data.BackAliases[itemID]; ok {
 					resolved[alias] = token
@@ -288,9 +277,13 @@ func main() {
 				itemOrAlias = itemID
 			}
 
-			err := WithRelinkOnAuthError(itemOrAlias, data, linker, func() error {
+			err := WithRelinkOnAuthError(itemOrAlias, linker, func() error {
 				token := data.Tokens[itemOrAlias]
-				res, err := client.GetAccounts(token)
+				ctx := context.Background()
+				req := plaid.NewAccountsGetRequest(token)
+				apiReq := client.AccountsGet(ctx)
+				apiReq = apiReq.AccountsGetRequest(*req)
+				res, _, err := apiReq.Execute()
 				if err != nil {
 					return err
 				}
@@ -326,23 +319,24 @@ func main() {
 				itemOrAlias = itemID
 			}
 
-			err := WithRelinkOnAuthError(itemOrAlias, data, linker, func() error {
+			err := WithRelinkOnAuthError(itemOrAlias, linker, func() error {
 				token := data.Tokens[itemOrAlias]
 
 				var accountIDs []string
 				if len(accountID) > 0 {
 					accountIDs = append(accountIDs, accountID)
 				}
+				count := int32(100)
+				offset := int32(0)
 
-				options := plaid.GetTransactionsOptions{
-					StartDate:  fromFlag,
-					EndDate:    toFlag,
-					AccountIDs: accountIDs,
-					Count:      100,
-					Offset:     0,
-				}
+				req := plaid.NewTransactionsGetRequest(token, fromFlag, toFlag)
+				req.SetOptions(plaid.TransactionsGetRequestOptions{
+					AccountIds: &accountIDs,
+					Count:      &count,
+					Offset:     &offset,
+				})
 
-				transactions, err := AllTransactions(options, client, token)
+				transactions, err := AllTransactions(*req, client)
 				if err != nil {
 					return err
 				}
@@ -368,10 +362,16 @@ func main() {
 		},
 	}
 	transactionsCommand.Flags().StringVarP(&fromFlag, "from", "f", "", "Date of first transaction (required)")
-	transactionsCommand.MarkFlagRequired("from")
+	err = transactionsCommand.MarkFlagRequired("from")
+	if err != nil {
+		log.Fatalln(err)
+	}
 
 	transactionsCommand.Flags().StringVarP(&toFlag, "to", "t", "", "Date of last transaction (required)")
-	transactionsCommand.MarkFlagRequired("to")
+	err = transactionsCommand.MarkFlagRequired("to")
+	if err != nil {
+		log.Fatalln(err)
+	}
 
 	transactionsCommand.Flags().StringVarP(&outputFormat, "output-format", "o", "json", "Output format")
 	transactionsCommand.Flags().StringVarP(&accountID, "account-id", "a", "", "Fetch transactions for this account ID only.")
@@ -390,21 +390,28 @@ func main() {
 				itemOrAlias = itemID
 			}
 
-			err := WithRelinkOnAuthError(itemOrAlias, data, linker, func() error {
+			err := WithRelinkOnAuthError(itemOrAlias, linker, func() error {
 				token := data.Tokens[itemOrAlias]
 
-				itemResp, err := client.GetItem(token)
+				itemReq := plaid.NewItemGetRequest(token)
+				ctx := context.Background()
+				itemApiReq := client.ItemGet(ctx)
+				itemApiReq = itemApiReq.ItemGetRequest(*itemReq)
+				itemResp, _, err := itemApiReq.Execute()
 				if err != nil {
 					return err
 				}
 
-				instID := itemResp.Item.InstitutionID
+				instID := *itemResp.Item.InstitutionId.Get()
 
-				opts := plaid.GetInstitutionByIDOptions{
-					IncludeOptionalMetadata: withOptionalMetadataFlag,
-					IncludeStatus:           withStatusFlag,
-				}
-				resp, err := client.GetInstitutionByIDWithOptions(instID, countries, opts)
+				req := plaid.NewInstitutionsGetByIdRequest(instID, countries)
+				req.SetOptions(plaid.InstitutionsGetByIdRequestOptions{
+					IncludeOptionalMetadata: &withOptionalMetadataFlag,
+					IncludeStatus:           &withStatusFlag,
+				})
+				apiReq := client.InstitutionsGetById(ctx)
+				apiReq = apiReq.InstitutionsGetByIdRequest(*req)
+				resp, _, err := apiReq.Execute()
 				if err != nil {
 					return err
 				}
@@ -478,60 +485,75 @@ Configuration:
 
 	if !viper.IsSet("plaid.client_id") {
 		log.Println("⚠️  PLAID_CLIENT_ID not set. Please see the configuration instructions below.")
-		rootCommand.Help()
+		err = rootCommand.Help()
+		if err != nil {
+			log.Fatalln(err)
+		}
 		os.Exit(1)
 	}
 	if !viper.IsSet("plaid.secret") {
 		log.Println("⚠️ PLAID_SECRET not set. Please see the configuration instructions below.")
-		rootCommand.Help()
+		err = rootCommand.Help()
+		if err != nil {
+			log.Fatalln(err)
+		}
 		os.Exit(1)
 	}
 
-	rootCommand.Execute()
+	err = rootCommand.Execute()
+	if err != nil {
+		log.Fatalln(err)
+	}
 }
 
-func AllTransactions(opts plaid.GetTransactionsOptions, client *plaid.Client, token string) ([]plaid.Transaction, error) {
+func AllTransactions(req plaid.TransactionsGetRequest, client *plaid.PlaidApiService) ([]plaid.Transaction, error) {
 	var transactions []plaid.Transaction
 
-	res, err := client.GetTransactionsWithOptions(token, opts)
+	ctx := context.Background()
+	apiReq := client.TransactionsGet(ctx)
+	apiReq = apiReq.TransactionsGetRequest(req)
+	res, _, err := apiReq.Execute()
 	if err != nil {
 		return transactions, err
 	}
-
 	transactions = append(transactions, res.Transactions...)
 
-	for len(transactions) < res.TotalTransactions {
-		opts.Offset += opts.Count
-		res, err := client.GetTransactionsWithOptions(token, opts)
+	for len(transactions) < int(res.TotalTransactions) {
+		offset := *req.Options.Offset + *req.Options.Count
+		req.Options.Offset = &offset
+		apiReq = client.TransactionsGet(ctx)
+		apiReq = apiReq.TransactionsGetRequest(req)
+		res, _, err = apiReq.Execute()
 		if err != nil {
 			return transactions, err
 		}
 
 		transactions = append(transactions, res.Transactions...)
-
 	}
 
 	return transactions, nil
 }
 
-func WithRelinkOnAuthError(itemID string, data *plaid_cli.Data, linker *plaid_cli.Linker, action func() error) error {
+func WithRelinkOnAuthError(itemID string, linker *plaid_cli.Linker, action func() error) error {
 	err := action()
-	if e, ok := err.(plaid.Error); ok {
-		if e.ErrorCode == "ITEM_LOGIN_REQUIRED" {
-			log.Println("Login expired. Relinking...")
+	pe, convertErr := plaid.ToPlaidError(err)
+	if convertErr != nil {
+		return errors.Join(err, convertErr)
+	}
+	if pe.ErrorCode == "ITEM_LOGIN_REQUIRED" {
+		log.Println("Login expired. Relinking...")
 
-			port := viper.GetString("link.port")
+		port := viper.GetString("link.port")
 
-			err = linker.Relink(itemID, port)
+		err = linker.Relink(itemID, port)
 
-			if err != nil {
-				return err
-			}
-
-			log.Println("Re-running action...")
-
-			err = action()
+		if err != nil {
+			return err
 		}
+
+		log.Println("Re-running action...")
+
+		err = action()
 	}
 
 	return err
@@ -548,7 +570,7 @@ func NewTransactionSerializer(t string) (TransactionSerializer, error) {
 	case "json":
 		return &JSONSerializer{}, nil
 	default:
-		return nil, errors.New(fmt.Sprintf("Invalid output format: %s", t))
+		return nil, fmt.Errorf("invalid output format: %s", t)
 	}
 }
 
@@ -577,7 +599,7 @@ func (w *CSVSerializer) serialize(txs []plaid.Transaction) ([]byte, error) {
 
 func SetAlias(data *plaid_cli.Data, itemID string, alias string) error {
 	if _, ok := data.Tokens[itemID]; !ok {
-		return errors.New(fmt.Sprintf("No access token found for item ID `%s`. Try re-linking your account with `plaid-cli link`.", itemID))
+		return fmt.Errorf("no access token found for item ID `%s`. Try re-linking your account with `plaid-cli link`", itemID)
 	}
 
 	data.Aliases[alias] = itemID
@@ -587,7 +609,7 @@ func SetAlias(data *plaid_cli.Data, itemID string, alias string) error {
 		return err
 	}
 
-	log.Println(fmt.Sprintf("Aliased %s to %s.", itemID, alias))
+	log.Printf("Aliased %s to %s.", itemID, alias)
 
 	return nil
 }

@@ -2,7 +2,8 @@ package plaid_cli
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"errors"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -16,7 +17,10 @@ type Data struct {
 }
 
 func LoadData(dataDir string) (*Data, error) {
-	os.MkdirAll(filepath.Join(dataDir, "data"), os.ModePerm)
+	err := os.MkdirAll(filepath.Join(dataDir, "data"), os.ModePerm)
+	if err != nil {
+		return nil, err
+	}
 
 	data := &Data{
 		DataDir:     dataDir,
@@ -30,11 +34,11 @@ func LoadData(dataDir string) (*Data, error) {
 }
 
 func (d *Data) loadAliases() {
-	var aliases map[string]string = make(map[string]string)
+	var aliases map[string]string
 	filePath := d.aliasesPath()
 	err := load(filePath, &aliases)
 	if err != nil {
-		log.Printf("Error loading aliases from %s. Assuming empty tokens. Error: %s", d.aliasesPath(), err)
+		log.Printf("Error loading aliases from %s. Assuming empty tokens.", d.aliasesPath())
 	}
 
 	d.Aliases = aliases
@@ -53,30 +57,35 @@ func (d *Data) aliasesPath() string {
 }
 
 func (d *Data) loadTokens() {
-	var tokens map[string]string = make(map[string]string)
+	var tokens map[string]string
 	filePath := d.tokensPath()
 	err := load(filePath, &tokens)
 	if err != nil {
-		log.Printf("Error loading tokens from %s. Assuming empty tokens. Error: %s", d.tokensPath(), err)
+		log.Printf("Error loading tokens from %s. Assuming empty tokens.", d.tokensPath())
 	}
 
 	d.Tokens = tokens
 }
 
-func load(filePath string, v interface{}) error {
-	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0755)
-	defer f.Close()
-
+func load(filePath string, v interface{}) (err error) {
+	var f *os.File
+	f, err = os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0755)
 	if err != nil {
 		return err
-	} else {
-		b, err := ioutil.ReadAll(f)
-		if err != nil {
-			return err
-		}
-
-		return json.Unmarshal(b, v)
 	}
+	defer func() {
+		closeErr := f.Close()
+		err = errors.Join(err, closeErr)
+	}()
+
+	var b []byte
+	b, err = io.ReadAll(f)
+	if err != nil {
+		return err
+	}
+
+	err = json.Unmarshal(b, v)
+	return err
 }
 
 func (d *Data) Save() error {
@@ -101,14 +110,19 @@ func (d *Data) SaveAliases() error {
 	return save(d.Aliases, d.aliasesPath())
 }
 
-func save(v interface{}, filePath string) error {
-	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0755)
+func save(v interface{}, filePath string) (err error) {
+	var f *os.File
+	f, err = os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0755)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		closeErr := f.Close()
+		err = errors.Join(err, closeErr)
+	}()
 
-	b, err := json.Marshal(v)
+	var b []byte
+	b, err = json.Marshal(v)
 	if err != nil {
 		return err
 	}
