@@ -109,12 +109,12 @@ func main() {
 
 	var plaidEnv plaid.Environment
 	switch plaidEnvStr {
-	case "development":
-		plaidEnv = plaid.Development
+	case "sandbox":
+		plaidEnv = plaid.Sandbox
 	case "production":
 		plaidEnv = plaid.Production
 	default:
-		log.Fatalln("Invalid plaid environment. Valid plaid environments are 'development' or 'production'.")
+		log.Fatalln("Invalid plaid environment. Valid plaid environments are 'sandbox' or 'production'.")
 	}
 
 	clientId := viper.GetString("plaid.client_id")
