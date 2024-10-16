@@ -34,7 +34,7 @@ func LoadData(dataDir string) (*Data, error) {
 }
 
 func (d *Data) loadAliases() {
-	var aliases map[string]string
+	aliases := make(map[string]string)
 	filePath := d.aliasesPath()
 	err := load(filePath, &aliases)
 	if err != nil {
@@ -57,7 +57,7 @@ func (d *Data) aliasesPath() string {
 }
 
 func (d *Data) loadTokens() {
-	var tokens map[string]string
+	tokens := make(map[string]string)
 	filePath := d.tokensPath()
 	err := load(filePath, &tokens)
 	if err != nil {
