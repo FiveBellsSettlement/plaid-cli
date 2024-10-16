@@ -1,6 +1,7 @@
 package plaid_cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -8,17 +9,24 @@ import (
 	"os"
 	"text/template"
 
-	"github.com/plaid/plaid-go/plaid"
+	"github.com/plaid/plaid-go/v26/plaid"
 	"github.com/skratchdot/open-golang/open"
 )
+
+const clientName = "plaid-cli"
+
+var products = []plaid.Products{
+	plaid.PRODUCTS_TRANSACTIONS,
+	plaid.PRODUCTS_AUTH,
+}
 
 type Linker struct {
 	Results       chan string
 	RelinkResults chan bool
 	Errors        chan error
-	Client        *plaid.Client
+	Client        *plaid.PlaidApiService
 	Data          *Data
-	countries     []string
+	countries     []plaid.CountryCode
 	lang          string
 }
 
@@ -31,19 +39,21 @@ func (l *Linker) Relink(itemID string, port string) error {
 	token := l.Data.Tokens[itemID]
 	hostname, err := os.Hostname()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	resp, err := l.Client.CreateLinkToken(plaid.LinkTokenConfigs{
-		User: &plaid.LinkTokenUser{
-			ClientUserID: hostname,
-		},
-		ClientName:   "plaid-cli",
-		CountryCodes: l.countries,
-		Language:     l.lang,
-		AccessToken:  token,
-	})
+
+	ctx := context.Background()
+	usr := *plaid.NewLinkTokenCreateRequestUser(hostname)
+	req := plaid.NewLinkTokenCreateRequest(clientName, l.lang, l.countries, usr)
+	req.SetProducts(products)
+	req.SetAccessToken(token)
+	// might need to add redirection for oauth
+	apiReq := l.Client.LinkTokenCreate(ctx)
+	apiReq = apiReq.LinkTokenCreateRequest(*req)
+	// consider wrapping http resp for errors
+	resp, _, err := apiReq.Execute()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	return l.relink(port, resp.LinkToken)
 }
@@ -51,25 +61,27 @@ func (l *Linker) Relink(itemID string, port string) error {
 func (l *Linker) Link(port string) (*TokenPair, error) {
 	hostname, err := os.Hostname()
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	resp, err := l.Client.CreateLinkToken(plaid.LinkTokenConfigs{
-		User: &plaid.LinkTokenUser{
-			ClientUserID: hostname,
-		},
-		ClientName:   "plaid-cli",
-		Products:     []string{"transactions"},
-		CountryCodes: l.countries,
-		Language:     l.lang,
-	})
+
+	ctx := context.Background()
+	usr := *plaid.NewLinkTokenCreateRequestUser(hostname)
+	req := plaid.NewLinkTokenCreateRequest(clientName, l.lang, l.countries, usr)
+	req.SetProducts(products)
+	// might need to add redirection for oauth
+	apiReq := l.Client.LinkTokenCreate(ctx)
+	apiReq = apiReq.LinkTokenCreateRequest(*req)
+	// consider wrapping http resp for errors
+	resp, _, err := apiReq.Execute()
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
+
 	return l.link(port, resp.LinkToken)
 }
 
 func (l *Linker) link(port string, linkToken string) (*TokenPair, error) {
-	log.Println(fmt.Sprintf("Starting Plaid Link on port %s...", port))
+	log.Printf("Starting Plaid Link on port %s...\n", port)
 
 	go func() {
 		http.HandleFunc("/link", handleLink(l, linkToken))
@@ -80,8 +92,11 @@ func (l *Linker) link(port string, linkToken string) (*TokenPair, error) {
 	}()
 
 	url := fmt.Sprintf("http://localhost:%s/link", port)
-	log.Println(fmt.Sprintf("Your browser should open automatically. If it doesn't, please visit %s to continue linking!", url))
-	open.Run(url)
+	log.Printf("Your browser should open automatically. If it doesn't, please visit %s to continue linking!", url)
+	err := open.Run(url)
+	if err != nil {
+		log.Printf("Failed to open browser: %v\n", err)
+	}
 
 	select {
 	case err := <-l.Errors:
@@ -94,7 +109,7 @@ func (l *Linker) link(port string, linkToken string) (*TokenPair, error) {
 		}
 
 		pair := &TokenPair{
-			ItemID:      res.ItemID,
+			ItemID:      res.ItemId,
 			AccessToken: res.AccessToken,
 		}
 
@@ -103,7 +118,7 @@ func (l *Linker) link(port string, linkToken string) (*TokenPair, error) {
 }
 
 func (l *Linker) relink(port string, linkToken string) error {
-	log.Println(fmt.Sprintf("Starting Plaid Link on port %s...", port))
+	log.Printf("Starting Plaid Link on port %s...\n", port)
 
 	go func() {
 		http.HandleFunc("/relink", handleRelink(l, linkToken))
@@ -114,8 +129,11 @@ func (l *Linker) relink(port string, linkToken string) error {
 	}()
 
 	url := fmt.Sprintf("http://localhost:%s/relink", port)
-	log.Println(fmt.Sprintf("Your browser should open automatically. If it doesn't, please visit %s to continue linking!", url))
-	open.Run(url)
+	log.Printf("Your browser should open automatically. If it doesn't, please visit %s to continue linking!", url)
+	err := open.Run(url)
+	if err != nil {
+		log.Printf("Failed to open browser: %v\n", err)
+	}
 
 	select {
 	case err := <-l.Errors:
@@ -125,11 +143,15 @@ func (l *Linker) relink(port string, linkToken string) error {
 	}
 }
 
-func (l *Linker) exchange(publicToken string) (plaid.ExchangePublicTokenResponse, error) {
-	return l.Client.ExchangePublicToken(publicToken)
+func (l *Linker) exchange(publicToken string) (plaid.ItemPublicTokenExchangeResponse, error) {
+	req := plaid.NewItemPublicTokenExchangeRequest(publicToken)
+	apiReq := l.Client.ItemPublicTokenExchange(context.Background())
+	apiReq = apiReq.ItemPublicTokenExchangeRequest(*req)
+	res, _, err := apiReq.Execute()
+	return res, err
 }
 
-func NewLinker(data *Data, client *plaid.Client, countries []string, lang string) *Linker {
+func NewLinker(data *Data, client *plaid.PlaidApiService, countries []plaid.CountryCode, lang string) *Linker {
 	return &Linker{
 		Results:       make(chan string),
 		RelinkResults: make(chan bool),
@@ -151,19 +173,33 @@ func handleLink(linker *Linker, linkToken string) func(w http.ResponseWriter, r 
 			d := LinkTmplData{
 				LinkToken: linkToken,
 			}
-			t.Execute(w, d)
+			err := t.Execute(w, d)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				linker.Errors <- err
+			}
 		case http.MethodPost:
-			r.ParseForm()
+			err := r.ParseForm()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				linker.Errors <- err
+				return
+			}
 			token := r.Form.Get("public_token")
 			if token != "" {
 				linker.Results <- token
 			} else {
-				linker.Errors <- errors.New("Empty public_token")
+				w.WriteHeader(http.StatusBadRequest)
+				linker.Errors <- errors.New("empty public_token")
+				return
 			}
 
-			fmt.Fprintf(w, "ok")
+			_, err = fmt.Fprintf(w, "ok")
+			if err != nil {
+				linker.Errors <- err
+			}
 		default:
-			linker.Errors <- errors.New("Invalid HTTP method")
+			linker.Errors <- errors.New("invalid HTTP method")
 		}
 	}
 }
@@ -186,24 +222,36 @@ func handleRelink(linker *Linker, linkToken string) func(w http.ResponseWriter, 
 			d := RelinkTmplData{
 				LinkToken: linkToken,
 			}
-			t.Execute(w, d)
+			err := t.Execute(w, d)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				linker.Errors <- err
+			}
 		case http.MethodPost:
-			r.ParseForm()
-			err := r.Form.Get("error")
-			if err != "" {
-				linker.Errors <- errors.New(err)
+			err := r.ParseForm()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				linker.Errors <- err
+				return
+			}
+			formErr := r.Form.Get("error")
+			if formErr != "" {
+				linker.Errors <- errors.New(formErr)
 			} else {
 				linker.RelinkResults <- true
 			}
 
-			fmt.Fprintf(w, "ok")
+			_, err = fmt.Fprintf(w, "ok")
+			if err != nil {
+				linker.Errors <- err
+			}
 		default:
-			linker.Errors <- errors.New("Invalid HTTP method")
+			linker.Errors <- errors.New("invalid HTTP method")
 		}
 	}
 }
 
-var linkTemplate string = `<html>
+var linkTemplate = `<html>
   <head>
     <style>
     .alert-success {
